@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, unquote
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
@@ -156,7 +157,14 @@ _NON_S3_VHOST_NAMES = frozenset({
 
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
-from ministack.core.responses import _12_DIGIT_RE, set_request_account_id, set_request_region
+from ministack.core.responses import (
+    _12_DIGIT_RE,
+    error_response_json,
+    error_response_xml,
+    get_account_id,
+    set_request_account_id,
+    set_request_region,
+)
 from ministack.core.router import detect_service, extract_access_key_id, extract_region
 
 # Must run before hypercorn emits its first Expect: 100-continue reply.
@@ -944,6 +952,7 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         "stepfunctions._SFN_WAIT_SCALE",
         "lambda_svc.LAMBDA_EXECUTOR",
         "cloudtrail._recording_enabled",
+        "organizations.SCP_ENFORCEMENT",
     }
     try:
         config = json.loads(body) if body else {}
@@ -971,7 +980,7 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
                     logger.warning("/_ministack/config: invalid SFN_WAIT_SCALE=%r", value)
                     continue
                 value = float_value
-            elif key == "cloudtrail._recording_enabled":
+            elif key in ("cloudtrail._recording_enabled", "organizations.SCP_ENFORCEMENT"):
                 value = str(value).lower() in ("1", "true", "yes")
             setattr(mod, var_name, value)
             applied[key] = value
@@ -1588,6 +1597,94 @@ def _routing_params(method: str, path: str, headers: dict, body: bytes, query_pa
     return routing_params
 
 
+# ---------------------------------------------------------------------------
+# Service Control Policy (SCP) enforcement — opt-in via organizations.SCP_ENFORCEMENT
+# ---------------------------------------------------------------------------
+
+# detect_service() key -> IAM action prefix, for the few that differ.
+_SCP_SERVICE_PREFIX = {"monitoring": "cloudwatch"}
+
+# Services whose SDKs expect an XML error envelope rather than JSON.
+_SCP_XML_SERVICES = {"s3", "sqs", "sns", "iam", "sts", "cloudformation", "ec2",
+                     "elasticloadbalancing", "route53", "monitoring"}
+
+
+def _scp_enforcement_enabled() -> bool:
+    """True only when organizations.SCP_ENFORCEMENT is on. Mirrors the lazy
+    short-circuit of _maybe_record_cloudtrail: O(1) and no import when off."""
+    mod = _loaded_modules.get("organizations")
+    if mod is None:
+        if os.environ.get("SCP_ENFORCEMENT", "0") == "1":
+            mod = _get_module("organizations")
+        else:
+            # Catch the case where /_ministack/config toggled the flag on a module
+            # that was imported by the config handler but not via _get_module.
+            mod = sys.modules.get("ministack.services.organizations")
+            if mod is None:
+                return False
+    return not isinstance(mod, _ErrorModule) and bool(getattr(mod, "SCP_ENFORCEMENT", False))
+
+
+def _build_scp_context(headers: dict, region: str) -> dict:
+    """Populate the SCP condition keys derivable from the request itself."""
+    h = headers or {}
+    ctx = {
+        "aws:RequestedRegion": region,
+        "aws:CurrentTime": datetime.now(timezone.utc).isoformat(),
+        "aws:EpochTime": str(int(time.time())),
+        "aws:ViaAWSService": "false",
+    }
+    xff = h.get("x-forwarded-for", "")
+    if xff:
+        ctx["aws:SourceIp"] = xff.split(",")[0].strip()
+    proto = h.get("x-forwarded-proto", "")
+    if proto:
+        ctx["aws:SecureTransport"] = "true" if proto == "https" else "false"
+    ua = h.get("user-agent", "")
+    if ua:
+        ctx["aws:UserAgent"] = ua
+    return ctx
+
+
+def _scp_denied_response(service: str, action: str, caller: str):
+    msg = (f"User: arn:aws:iam::{caller}:root is not authorized to perform: {action} "
+           f"with an explicit deny in a service control policy")
+    if service in _SCP_XML_SERVICES:
+        ns = ("http://s3.amazonaws.com/doc/2006-03-01/" if service == "s3"
+              else "http://queue.amazonaws.com/doc/2012-11-05/")
+        return error_response_xml("AccessDenied", msg, 403, namespace=ns)
+    return error_response_json("AccessDeniedException", msg, 403)
+
+
+def _maybe_enforce_scp(service, method, path, headers, body, query_params, region):
+    """Return a 403 denied-response tuple if SCPs block the request, else None.
+
+    Fails open on any internal error — an enforcement bug must never break the
+    data plane."""
+    if service == "organizations" or path.startswith("/_"):
+        return None
+    try:
+        from ministack.core import scp_resources
+
+        org_mod = _get_module("organizations")
+        if isinstance(org_mod, _ErrorModule):
+            return None
+        caller = get_account_id()
+        operation = _ct_event_name(service, method, path, headers, query_params)
+        action = f"{_SCP_SERVICE_PREFIX.get(service, service)}:{operation}"
+        resource_arn = scp_resources.extract_resource_arn(
+            service, method, path, headers, body, query_params, action)
+        base_ctx = _build_scp_context(headers, region)
+        allowed, reason = org_mod.scp_decision(caller, action, resource_arn, base_ctx)
+        if allowed:
+            return None
+        logger.info("SCP denied %s for account %s (%s)", action, caller, reason)
+        return _scp_denied_response(service, action, caller)
+    except Exception as e:
+        logger.warning("SCP enforcement error (allowing request): %s", e)
+        return None
+
+
 async def _dispatch_service_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
 ):
@@ -1606,17 +1703,24 @@ async def _dispatch_service_request(
             json.dumps({"error": f"Unsupported service: {service}"}).encode(),
         )
 
-    try:
-        status, resp_headers, resp_body = await handler(method, path, headers, body, query_params)
-    except Exception as e:
-        logger.exception("Error handling %s request: %s", service, e)
-        return (
-            500,
-            {"Content-Type": "application/json"},
-            json.dumps({"__type": "InternalError", "message": str(e)}).encode(),
-        )
+    denied = None
+    if _scp_enforcement_enabled():
+        denied = _maybe_enforce_scp(service, method, path, headers, body, query_params, region)
 
-    _maybe_record_cloudtrail(service, method, path, headers, body, query_params, request_id, region)
+    if denied is not None:
+        status, resp_headers, resp_body = denied
+    else:
+        try:
+            status, resp_headers, resp_body = await handler(method, path, headers, body, query_params)
+        except Exception as e:
+            logger.exception("Error handling %s request: %s", service, e)
+            return (
+                500,
+                {"Content-Type": "application/json"},
+                json.dumps({"__type": "InternalError", "message": str(e)}).encode(),
+            )
+
+        _maybe_record_cloudtrail(service, method, path, headers, body, query_params, request_id, region)
 
     resp_headers.update(
         {

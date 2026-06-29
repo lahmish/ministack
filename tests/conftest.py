@@ -109,6 +109,14 @@ _SERIAL_TESTS = {
     # Account-global mutations (password policy, alias); must run serially.
     "tests/test_iam.py::test_iam_password_policy_absent_then_set",
     "tests/test_iam.py::test_iam_account_alias_crud",
+    # SCP enforcement flips the process-global organizations.SCP_ENFORCEMENT flag
+    # via /_ministack/config; must run in the dedicated serial phase.
+    "tests/test_organizations_scp.py::test_scp_enf_blocks_member_but_exempts_management",
+    "tests/test_organizations_scp.py::test_scp_enf_default_full_access_allows",
+    "tests/test_organizations_scp.py::test_scp_enf_implicit_deny_allow_list",
+    "tests/test_organizations_scp.py::test_scp_enf_region_condition",
+    "tests/test_organizations_scp.py::test_scp_enf_resource_scoped_deny_kinesis",
+    "tests/test_organizations_scp.py::test_scp_enf_principal_org_paths_condition",
 }
 
 
