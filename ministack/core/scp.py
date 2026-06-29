@@ -42,12 +42,27 @@ def _as_list(value):
     return [str(value)]
 
 
+def _norm_principal(p):
+    """Normalise a Principal/NotPrincipal element to ``"*"``, a ``{category: [values]}``
+    dict, or ``None`` when absent. Used by RCPs (SCP statements have no Principal)."""
+    if p is None:
+        return None
+    if p == "*":
+        return "*"
+    if isinstance(p, str):
+        return {"AWS": [p]}
+    if isinstance(p, dict):
+        return {k: _as_list(v) for k, v in p.items()}
+    return None
+
+
 def parse_policy(document):
     """Normalise a policy document (JSON string or dict) into a list of statements.
 
     Each normalised statement is a dict with keys ``Effect``, ``Action``,
     ``NotAction``, ``Resource``, ``NotResource`` (lists, or ``None`` when the
-    element is absent) and ``Condition`` (dict).
+    element is absent), ``Principal``/``NotPrincipal`` (``"*"`` / dict / ``None`` —
+    present only on RCPs) and ``Condition`` (dict).
     """
     if isinstance(document, str):
         try:
@@ -71,6 +86,8 @@ def parse_policy(document):
             "NotAction": _as_list(st.get("NotAction")) if "NotAction" in st else None,
             "Resource": _as_list(st.get("Resource")) if "Resource" in st else None,
             "NotResource": _as_list(st.get("NotResource")) if "NotResource" in st else None,
+            "Principal": _norm_principal(st.get("Principal")) if "Principal" in st else None,
+            "NotPrincipal": _norm_principal(st.get("NotPrincipal")) if "NotPrincipal" in st else None,
             "Condition": st.get("Condition") if isinstance(st.get("Condition"), dict) else {},
         })
     return out
@@ -120,7 +137,47 @@ def _resource_side(stmt, resource_arn, effect):
     return resource_matches(patterns, resource_arn)
 
 
+def principal_matches(spec, ctx):
+    """True if the request's principal (from ctx) matches a Principal spec.
+
+    Handles ``"*"`` and ``{"AWS": [...]}`` (account id, account-root ARN, or ARN
+    wildcard against ``aws:PrincipalArn``/``aws:PrincipalAccount``) and
+    ``{"Service": [...]}`` (only when the caller is flagged as a service principal).
+    Federated/CanonicalUser are not modelled."""
+    if spec == "*":
+        return True
+    if not isinstance(spec, dict):
+        return False
+    caller_arn = str(ctx.get("aws:PrincipalArn", ""))
+    caller_acct = str(ctx.get("aws:PrincipalAccount", ""))
+    is_service = str(ctx.get("aws:PrincipalIsAWSService", "false")).lower() == "true"
+    for category, values in spec.items():
+        if category == "AWS":
+            for v in values:
+                v = str(v)
+                if v == "*" or v == caller_acct or v == f"arn:aws:iam::{caller_acct}:root":
+                    return True
+                if caller_arn and fnmatch.fnmatchcase(caller_arn, v):
+                    return True
+        elif category == "Service" and is_service:
+            svc = str(ctx.get("aws:PrincipalServiceName", ""))
+            if any(fnmatch.fnmatchcase(svc, str(v)) for v in values):
+                return True
+    return False
+
+
+def _principal_side(stmt, ctx):
+    # No Principal element -> SCP-style statement; principal dimension is N/A.
+    if stmt["Principal"] is None and stmt["NotPrincipal"] is None:
+        return True
+    if stmt["NotPrincipal"] is not None:
+        return not principal_matches(stmt["NotPrincipal"], ctx)
+    return principal_matches(stmt["Principal"], ctx)
+
+
 def statement_applies(stmt, action, resource_arn, ctx):
+    if not _principal_side(stmt, ctx):
+        return False
     if not _action_side(stmt, action):
         return False
     if not _resource_side(stmt, resource_arn, stmt["Effect"]):

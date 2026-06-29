@@ -167,6 +167,51 @@ def test_not_action_inverts():
     assert not scp.statement_applies(st, "s3:PutObject", None, {})
 
 
+# --- Principal matching (RCPs) ---------------------------------------------
+
+def test_principal_star_matches_anyone():
+    st = _p({"Effect": "Deny", "Principal": "*", "Action": "*", "Resource": "*"})[0]
+    assert scp.statement_applies(st, "kms:Decrypt", None, {"aws:PrincipalAccount": "111"})
+
+
+def test_principal_aws_account_match():
+    st = _p({"Effect": "Allow", "Principal": {"AWS": "111122223333"}, "Action": "*", "Resource": "*"})[0]
+    assert scp.statement_applies(st, "kms:x", None, {"aws:PrincipalAccount": "111122223333"})
+    assert not scp.statement_applies(st, "kms:x", None, {"aws:PrincipalAccount": "999988887777"})
+
+
+def test_principal_aws_arn_wildcard():
+    st = _p({"Effect": "Deny", "Principal": {"AWS": "arn:aws:iam::111:role/*"},
+             "Action": "*", "Resource": "*"})[0]
+    assert scp.statement_applies(st, "kms:x", None, {"aws:PrincipalArn": "arn:aws:iam::111:role/Admin"})
+    assert not scp.statement_applies(st, "kms:x", None, {"aws:PrincipalArn": "arn:aws:iam::111:user/bob"})
+
+
+def test_not_principal_inverts():
+    st = _p({"Effect": "Deny", "NotPrincipal": {"AWS": "111"}, "Action": "*", "Resource": "*"})[0]
+    assert scp.statement_applies(st, "kms:x", None, {"aws:PrincipalAccount": "222"})       # not 111 -> applies
+    assert not scp.statement_applies(st, "kms:x", None, {"aws:PrincipalAccount": "111"})   # 111 -> excluded
+
+
+def test_statement_without_principal_is_unaffected_by_principal_ctx():
+    # SCP-style statement (no Principal) applies regardless of principal context.
+    st = _p({"Effect": "Deny", "Action": "s3:*", "Resource": "*"})[0]
+    assert scp.statement_applies(st, "s3:PutObject", None, {})
+    assert scp.statement_applies(st, "s3:PutObject", None, {"aws:PrincipalAccount": "anything"})
+
+
+def test_rcp_deny_unless_in_org():
+    # The canonical data-perimeter RCP: deny unless the principal is in the org.
+    st = _p({"Effect": "Deny", "Principal": "*", "Action": "*", "Resource": "*",
+             "Condition": {"StringNotEquals": {"aws:PrincipalOrgID": "o-myorg"}}})[0]
+    assert not scp.statement_applies(st, "kms:Decrypt", None, {"aws:PrincipalOrgID": "o-myorg"})   # in org -> allowed
+    assert scp.statement_applies(st, "kms:Decrypt", None, {"aws:PrincipalOrgID": "o-other"})       # other org -> denied
+    # Absent key: plain StringNotEquals returns false (AWS semantics) so the Deny does
+    # NOT fire. MiniStack supplies aws:PrincipalOrgID for in-org callers, and an
+    # out-of-org caller carries its own org id (-> the "other org" case above).
+    assert not scp.statement_applies(st, "kms:Decrypt", None, {})
+
+
 # --- evaluate_scps truth tables --------------------------------------------
 
 def test_eval_explicit_deny_wins():

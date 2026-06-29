@@ -953,6 +953,7 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         "lambda_svc.LAMBDA_EXECUTOR",
         "cloudtrail._recording_enabled",
         "organizations.SCP_ENFORCEMENT",
+        "organizations.RCP_ENFORCEMENT",
     }
     try:
         config = json.loads(body) if body else {}
@@ -980,7 +981,8 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
                     logger.warning("/_ministack/config: invalid SFN_WAIT_SCALE=%r", value)
                     continue
                 value = float_value
-            elif key in ("cloudtrail._recording_enabled", "organizations.SCP_ENFORCEMENT"):
+            elif key in ("cloudtrail._recording_enabled", "organizations.SCP_ENFORCEMENT",
+                         "organizations.RCP_ENFORCEMENT"):
                 value = str(value).lower() in ("1", "true", "yes")
             setattr(mod, var_name, value)
             applied[key] = value
@@ -1646,9 +1648,9 @@ def _build_scp_context(headers: dict, region: str) -> dict:
     return ctx
 
 
-def _scp_denied_response(service: str, action: str, caller: str):
+def _org_policy_denied_response(service, action, caller, kind="service control policy"):
     msg = (f"User: arn:aws:iam::{caller}:root is not authorized to perform: {action} "
-           f"with an explicit deny in a service control policy")
+           f"with an explicit deny in a {kind}")
     if service in _SCP_XML_SERVICES:
         ns = ("http://s3.amazonaws.com/doc/2006-03-01/" if service == "s3"
               else "http://queue.amazonaws.com/doc/2012-11-05/")
@@ -1679,9 +1681,60 @@ def _maybe_enforce_scp(service, method, path, headers, body, query_params, regio
         if allowed:
             return None
         logger.info("SCP denied %s for account %s (%s)", action, caller, reason)
-        return _scp_denied_response(service, action, caller)
+        return _org_policy_denied_response(service, action, caller)
     except Exception as e:
         logger.warning("SCP enforcement error (allowing request): %s", e)
+        return None
+
+
+# Services AWS evaluates RCPs for, limited to those MiniStack can enforce (i.e. for
+# which scp_resources can recover a resource ARN). AWS supports more RCP services
+# (Cognito, AppConfig, AppStream, etc.) that have no MiniStack resource extractor.
+_RCP_SUPPORTED_SERVICES = {"s3", "sts", "sqs", "secretsmanager", "kms",
+                           "logs", "dynamodb", "ecr"}
+
+
+def _rcp_enforcement_enabled() -> bool:
+    """True only when organizations.RCP_ENFORCEMENT is on (mirrors the SCP gate)."""
+    mod = _loaded_modules.get("organizations")
+    if mod is None:
+        if os.environ.get("RCP_ENFORCEMENT", "0") == "1":
+            mod = _get_module("organizations")
+        else:
+            mod = sys.modules.get("ministack.services.organizations")
+            if mod is None:
+                return False
+    return not isinstance(mod, _ErrorModule) and bool(getattr(mod, "RCP_ENFORCEMENT", False))
+
+
+def _maybe_enforce_rcp(service, method, path, headers, body, query_params, region):
+    """Return a 403 denied-response if an RCP blocks the request, else None.
+
+    RCPs apply only to the AWS-supported services and need the resource ARN (to find
+    the resource's owning account). Fails open on any internal error."""
+    if service not in _RCP_SUPPORTED_SERVICES or path.startswith("/_"):
+        return None
+    try:
+        from ministack.core import scp_resources
+
+        org_mod = _get_module("organizations")
+        if isinstance(org_mod, _ErrorModule):
+            return None
+        caller = get_account_id()
+        operation = _ct_event_name(service, method, path, headers, query_params)
+        action = f"{_SCP_SERVICE_PREFIX.get(service, service)}:{operation}"
+        resource_arn = scp_resources.extract_resource_arn(
+            service, method, path, headers, body, query_params, action)
+        if not resource_arn:
+            return None  # can't determine the resource's account -> RCPs can't apply
+        base_ctx = _build_scp_context(headers, region)
+        allowed, reason = org_mod.rcp_decision(caller, action, resource_arn, base_ctx)
+        if allowed:
+            return None
+        logger.info("RCP denied %s for account %s (%s)", action, caller, reason)
+        return _org_policy_denied_response(service, action, caller, "resource control policy")
+    except Exception as e:
+        logger.warning("RCP enforcement error (allowing request): %s", e)
         return None
 
 
@@ -1706,6 +1759,8 @@ async def _dispatch_service_request(
     denied = None
     if _scp_enforcement_enabled():
         denied = _maybe_enforce_scp(service, method, path, headers, body, query_params, region)
+    if denied is None and _rcp_enforcement_enabled():
+        denied = _maybe_enforce_rcp(service, method, path, headers, body, query_params, region)
 
     if denied is not None:
         status, resp_headers, resp_body = denied

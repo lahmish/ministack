@@ -206,6 +206,19 @@ _EXTRACTORS = {
 }
 
 
+def account_from_arn(arn):
+    """Return the account-id field (segment 4) of an ARN, or None when absent.
+
+    S3 ARNs (`arn:aws:s3:::bucket/key`) carry no account, so this returns None
+    for them — RCP evaluation then falls back to the caller's account."""
+    if not arn or not isinstance(arn, str) or not arn.startswith("arn:"):
+        return None
+    parts = arn.split(":")
+    if len(parts) < 5:
+        return None
+    return parts[4] or None
+
+
 def extract_resource_arn(service, method, path, headers, body, query_params, action):
     """Return the target resource ARN, or ``None`` when it cannot be determined."""
     fn = _EXTRACTORS.get(service)

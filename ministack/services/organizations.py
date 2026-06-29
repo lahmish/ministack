@@ -19,7 +19,7 @@ import os
 import re
 import time
 
-from ministack.core import scp
+from ministack.core import scp, scp_resources
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -58,17 +58,35 @@ _tags = AccountScopedDict()             # resource_id (policy/root/ou/account) -
 # account id, so SCP enforcement must be able to find the owning org graph to evaluate.
 _account_org_index: dict = {}
 
-# Toggleable enforcement flag (mirrors cloudtrail._recording_enabled). Read by app.py's SCP
-# gate; flipped at boot via SCP_ENFORCEMENT=1 or at runtime via POST /_ministack/config.
+# Toggleable enforcement flags (mirror cloudtrail._recording_enabled). Read by app.py's
+# policy gates; flipped at boot via env or at runtime via POST /_ministack/config.
 SCP_ENFORCEMENT = os.environ.get("SCP_ENFORCEMENT", "0") == "1"
+RCP_ENFORCEMENT = os.environ.get("RCP_ENFORCEMENT", "0") == "1"
 
 _SCP_TYPE = "SERVICE_CONTROL_POLICY"
+_RCP_TYPE = "RESOURCE_CONTROL_POLICY"
+_POLICY_TYPES = {_SCP_TYPE, _RCP_TYPE}
+_ARN_SEGMENT = {_SCP_TYPE: "service_control_policy", _RCP_TYPE: "resource_control_policy"}
+
 _FULL_ACCESS_ID = "p-FullAWSAccess"
 _FULL_ACCESS_ARN = "arn:aws:organizations::aws:policy/service_control_policy/p-FullAWSAccess"
 _FULL_ACCESS_CONTENT = (
     '{"Version": "2012-10-17", "Statement": '
     '[{"Effect": "Allow", "Action": "*", "Resource": "*"}]}'
 )
+# RCP default — same baseline Allow but with the Principal element RCPs require.
+_RCPFULL_ID = "p-RCPFullAWSAccess"
+_RCPFULL_ARN = "arn:aws:organizations::aws:policy/resource_control_policy/p-RCPFullAWSAccess"
+_RCPFULL_CONTENT = (
+    '{"Version": "2012-10-17", "Statement": '
+    '[{"Effect": "Allow", "Principal": "*", "Action": "*", "Resource": "*"}]}'
+)
+
+# Default (AWS-managed) policy specs, indexed by policy type.
+_DEFAULT_POLICIES = {
+    _SCP_TYPE: (_FULL_ACCESS_ID, _FULL_ACCESS_ARN, "FullAWSAccess", _FULL_ACCESS_CONTENT),
+    _RCP_TYPE: (_RCPFULL_ID, _RCPFULL_ARN, "RCPFullAWSAccess", _RCPFULL_CONTENT),
+}
 
 
 def reset():
@@ -140,6 +158,7 @@ def _ensure_org():
         "MasterAccountEmail": f"master+{master}@ministack.local",
         "AvailablePolicyTypes": [
             {"Type": "SERVICE_CONTROL_POLICY", "Status": "ENABLED"},
+            {"Type": "RESOURCE_CONTROL_POLICY", "Status": "ENABLED"},
         ],
     }
     _roots[root_id] = {
@@ -160,10 +179,11 @@ def _ensure_org():
         "Path": "/",
         "_ParentId": root_id,
     }
-    # Every entity starts with the AWS-managed FullAWSAccess SCP attached (real-AWS default).
-    _ensure_full_access_policy()
-    _attach(_FULL_ACCESS_ID, root_id)
-    _attach(_FULL_ACCESS_ID, master)
+    # Every entity starts with the AWS-managed default policy of each type attached
+    # (real-AWS default; enforcement stays gated on the policy type being enabled).
+    _ensure_default_policies()
+    _attach_default_policies(root_id)
+    _attach_default_policies(master)
     _account_org_index[master] = master
 
 
@@ -228,18 +248,25 @@ def _new_policy_id() -> str:
     return pid
 
 
-def _ensure_full_access_policy():
-    """Create the AWS-managed p-FullAWSAccess policy for the current org if absent."""
-    if _FULL_ACCESS_ID not in _policies:
-        _policies[_FULL_ACCESS_ID] = {
-            "Id": _FULL_ACCESS_ID,
-            "Arn": _FULL_ACCESS_ARN,
-            "Name": "FullAWSAccess",
-            "Description": "Allows access to every operation",
-            "Type": _SCP_TYPE,
-            "AwsManaged": True,
-            "_Content": _FULL_ACCESS_CONTENT,
-        }
+def _ensure_default_policies():
+    """Create the AWS-managed default policy of each type for the current org if absent."""
+    for ptype, (pid, arn, name, content) in _DEFAULT_POLICIES.items():
+        if pid not in _policies:
+            _policies[pid] = {
+                "Id": pid,
+                "Arn": arn,
+                "Name": name,
+                "Description": "Allows access to every operation",
+                "Type": ptype,
+                "AwsManaged": True,
+                "_Content": content,
+            }
+
+
+def _attach_default_policies(target_id: str):
+    """Attach the AWS-managed default of every policy type to a target."""
+    for pid, *_ in _DEFAULT_POLICIES.values():
+        _attach(pid, target_id)
 
 
 def _attach(policy_id: str, target_id: str):
@@ -286,12 +313,47 @@ def _validate_policy_doc(content):
     return doc
 
 
-def _scp_type_enabled() -> bool:
+def _rcp_violation(doc):
+    """Return an error message if an RCP document breaks RCP-specific rules, else None.
+
+    Real AWS: customer RCP statements must use Effect 'Deny', must set Principal to
+    '*' (principals are targeted via Condition), may not use NotPrincipal/NotAction,
+    and the Action must be service-scoped (a bare '*' is rejected)."""
+    statements = doc.get("Statement")
+    if isinstance(statements, dict):
+        statements = [statements]
+    if not isinstance(statements, list) or not statements:
+        return "An RCP must contain at least one statement"
+    for st in statements:
+        if not isinstance(st, dict):
+            return "Invalid RCP statement"
+        if st.get("Effect") != "Deny":
+            return "RCP statements must use Effect 'Deny'"
+        if st.get("Principal") != "*":
+            return "RCP statements must set Principal to '*'"
+        if "NotPrincipal" in st or "NotAction" in st:
+            return "RCPs do not support the NotPrincipal or NotAction elements"
+        actions = st.get("Action")
+        if actions is None:
+            return "RCP statements must include an Action"
+        alist = actions if isinstance(actions, list) else [actions]
+        if any(a == "*" for a in alist):
+            return "RCPs require a service-scoped Action; a bare '*' is not allowed"
+        if "Resource" not in st and "NotResource" not in st:
+            return "RCP statements must include a Resource or NotResource"
+    return None
+
+
+def _policy_type_enabled(ptype: str) -> bool:
     root = next(iter(_roots.values()), None)
     if not root:
         return False
-    return any(pt.get("Type") == _SCP_TYPE and pt.get("Status") == "ENABLED"
+    return any(pt.get("Type") == ptype and pt.get("Status") == "ENABLED"
                for pt in root.get("PolicyTypes", []))
+
+
+def _scp_type_enabled() -> bool:
+    return _policy_type_enabled(_SCP_TYPE)
 
 
 def _resource_exists(rid) -> bool:
@@ -339,12 +401,13 @@ def _node_chain(account_id):
     return chain
 
 
-def _statements_for_target(target_id):
-    """Concatenate the normalised statements of every SCP attached to a node."""
+def _statements_for_target(target_id, policy_type):
+    """Concatenate the normalised statements of every policy of ``policy_type``
+    attached to a node."""
     statements = []
     for pid in (_target_policies.get(target_id) or []):
         rec = _policies.get(pid)
-        if rec:
+        if rec and rec.get("Type") == policy_type:
             statements.extend(scp.parse_policy(rec["_Content"]))
     return statements
 
@@ -372,7 +435,7 @@ def scp_decision(caller_account, action, resource_arn, base_ctx):
         if caller_account not in _accounts:
             return True, "not-member-of-this-org"
         chain = _node_chain(caller_account)
-        node_statements = [_statements_for_target(n) for n in chain]
+        node_statements = [_statements_for_target(n, _SCP_TYPE) for n in chain]
         org_id = org.get("Id", "")
         # aws:PrincipalOrgPaths entry is the top-down path o-id/r-root/ou.../account/
         org_path = org_id + "/" + "/".join(reversed(chain)) + "/"
@@ -386,6 +449,60 @@ def scp_decision(caller_account, action, resource_arn, base_ctx):
         ctx["aws:userid"] = caller_account
         decision = scp.evaluate_scps(node_statements, action, resource_arn, ctx)
         return decision == "allow", f"scp-{decision}"
+    finally:
+        set_request_account_id(saved)
+
+
+def _org_id_for_master(master):
+    """Return the org id for a master account via brief impersonation, or ''."""
+    if not master:
+        return ""
+    saved = get_account_id()
+    try:
+        set_request_account_id(master)
+        org = _orgs.get("self")
+        return org.get("Id", "") if org else ""
+    finally:
+        set_request_account_id(saved)
+
+
+def rcp_decision(caller_account, action, resource_arn, base_ctx):
+    """Decide whether an RCP-governed request is allowed. Returns ``(allowed, reason)``.
+
+    RCPs are resource-side: we evaluate the **resource owner's** RCP chain against the
+    **calling** principal. The resource account comes from the resource ARN (falling
+    back to the caller for account-less S3 ARNs)."""
+    if not resource_arn:
+        return True, "no-resource-arn"
+    res_acct = scp_resources.account_from_arn(resource_arn) or caller_account
+    master = _account_org_index.get(res_acct)
+    if master is None:
+        return True, "resource-not-in-org"
+    if master == res_acct:
+        return True, "management-account-resource-exempt"
+    # Caller's own org id (computed before impersonating the resource master) so the
+    # aws:PrincipalOrgID / aws:SourceOrgID keys reflect the CALLER, not the resource.
+    caller_org_id = _org_id_for_master(_account_org_index.get(caller_account))
+    saved = get_account_id()
+    try:
+        set_request_account_id(master)
+        org = _orgs.get("self")
+        if not org or org.get("FeatureSet") != "ALL":
+            return True, "no-all-features"
+        if not _policy_type_enabled(_RCP_TYPE):
+            return True, "rcp-type-not-enabled"
+        if res_acct not in _accounts:
+            return True, "resource-not-member"
+        chain = _node_chain(res_acct)
+        node_statements = [_statements_for_target(n, _RCP_TYPE) for n in chain]
+        ctx = dict(base_ctx)
+        ctx["aws:PrincipalAccount"] = caller_account
+        ctx["aws:PrincipalArn"] = f"arn:aws:iam::{caller_account}:root"
+        ctx["aws:PrincipalOrgID"] = caller_org_id
+        ctx["aws:SourceOrgID"] = caller_org_id
+        ctx["aws:PrincipalIsAWSService"] = "false"
+        decision = scp.evaluate_scps(node_statements, action, resource_arn, ctx)
+        return decision == "allow", f"rcp-{decision}"
     finally:
         set_request_account_id(saved)
 
@@ -455,7 +572,7 @@ def _create_organizational_unit(payload):
         "_ParentId": parent_id,
     }
     _ous[ou_id] = rec
-    _attach(_FULL_ACCESS_ID, ou_id)
+    _attach_default_policies(ou_id)
     return _json(200, {"OrganizationalUnit": _public_ou(rec)})
 
 
@@ -513,7 +630,7 @@ def _describe_create_account_status(payload):
         _accounts[aid] = _account_record(
             aid, email=rec["_Email"], name=rec["AccountName"],
             joined_method="CREATED", parent_id=_root_id())
-        _attach(_FULL_ACCESS_ID, aid)
+        _attach_default_policies(aid)
         _account_org_index[aid] = get_account_id()
         rec["State"] = "SUCCEEDED"
         rec["AccountId"] = aid
@@ -643,7 +760,7 @@ def _accept_handshake(payload):
         _accounts[invited] = _account_record(
             invited, email=f"member+{invited}@ministack.local", name=f"Account {invited}",
             joined_method="INVITED", parent_id=_root_id())
-        _attach(_FULL_ACCESS_ID, invited)
+        _attach_default_policies(invited)
         _account_org_index[invited] = master
     finally:
         set_request_account_id(caller)
@@ -666,16 +783,20 @@ def _create_policy(payload):
     name = payload.get("Name")
     ptype = payload.get("Type")
     description = payload.get("Description", "")
-    if ptype != _SCP_TYPE:
+    if ptype not in _POLICY_TYPES:
         return error_response_json("InvalidInputException",
-                                   "Type must be SERVICE_CONTROL_POLICY", 400)
+                                   "Type must be SERVICE_CONTROL_POLICY or "
+                                   "RESOURCE_CONTROL_POLICY", 400)
     if not name or not content:
         return error_response_json("InvalidInputException",
                                    "Name and Content are required", 400)
-    if _validate_policy_doc(content) is None:
+    parsed = _validate_policy_doc(content)
+    if parsed is None:
         return error_response_json("MalformedPolicyDocumentException",
                                    "The provided policy document is not valid", 400)
-    if any(p.get("Name") == name for p in _policies.values()):
+    if ptype == _RCP_TYPE and (v := _rcp_violation(parsed)):
+        return error_response_json("MalformedPolicyDocumentException", v, 400)
+    if any(p.get("Name") == name and p.get("Type") == ptype for p in _policies.values()):
         return error_response_json("DuplicatePolicyException",
                                    f"A policy named {name} already exists", 400)
     pid = _new_policy_id()
@@ -683,10 +804,11 @@ def _create_policy(payload):
     master = get_account_id()
     rec = {
         "Id": pid,
-        "Arn": f"arn:aws:organizations::{master}:policy/{org_id}/service_control_policy/{pid}",
+        "Arn": f"arn:aws:organizations::{master}:policy/{org_id}/"
+               f"{_ARN_SEGMENT[ptype]}/{pid}",
         "Name": name,
         "Description": description,
-        "Type": _SCP_TYPE,
+        "Type": ptype,
         "AwsManaged": False,
         "_Content": content,
     }
@@ -721,13 +843,18 @@ def _update_policy(payload):
     name = payload.get("Name")
     content = payload.get("Content")
     description = payload.get("Description")
-    if name is not None and name != rec["Name"] and \
-            any(p.get("Name") == name for p in _policies.values()):
+    if name is not None and name != rec["Name"] and any(
+            p.get("Name") == name and p.get("Type") == rec.get("Type")
+            for p in _policies.values()):
         return error_response_json("DuplicatePolicyException",
                                    f"A policy named {name} already exists", 400)
-    if content is not None and _validate_policy_doc(content) is None:
-        return error_response_json("MalformedPolicyDocumentException",
-                                   "The provided policy document is not valid", 400)
+    if content is not None:
+        parsed = _validate_policy_doc(content)
+        if parsed is None:
+            return error_response_json("MalformedPolicyDocumentException",
+                                       "The provided policy document is not valid", 400)
+        if rec.get("Type") == _RCP_TYPE and (v := _rcp_violation(parsed)):
+            return error_response_json("MalformedPolicyDocumentException", v, 400)
     if name is not None:
         rec["Name"] = name
     if description is not None:
@@ -759,10 +886,12 @@ def _delete_policy(payload):
 
 def _list_policies(payload):
     _ensure_org()
-    if payload.get("Filter") != _SCP_TYPE:
+    pfilter = payload.get("Filter")
+    if pfilter not in _POLICY_TYPES:
         return error_response_json("InvalidInputException",
-                                   "Filter must be SERVICE_CONTROL_POLICY", 400)
-    out = [_policy_summary(p) for p in _policies.values()]
+                                   "Filter must be SERVICE_CONTROL_POLICY or "
+                                   "RESOURCE_CONTROL_POLICY", 400)
+    out = [_policy_summary(p) for p in _policies.values() if p.get("Type") == pfilter]
     page, nxt = _paginate(out, payload)
     return _json(200, {"Policies": page, "NextToken": nxt})
 
@@ -770,15 +899,18 @@ def _list_policies(payload):
 def _list_policies_for_target(payload):
     _ensure_org()
     target_id = payload.get("TargetId")
-    if payload.get("Filter") != _SCP_TYPE:
+    pfilter = payload.get("Filter")
+    if pfilter not in _POLICY_TYPES:
         return error_response_json("InvalidInputException",
-                                   "Filter must be SERVICE_CONTROL_POLICY", 400)
+                                   "Filter must be SERVICE_CONTROL_POLICY or "
+                                   "RESOURCE_CONTROL_POLICY", 400)
     rec, _ttype = _resolve_target(target_id)
     if rec is None:
         return error_response_json("TargetNotFoundException",
                                    f"Target {target_id} not found", 400)
     pids = _target_policies.get(target_id) or []
-    out = [_policy_summary(_policies[pid]) for pid in pids if pid in _policies]
+    out = [_policy_summary(_policies[pid]) for pid in pids
+           if pid in _policies and _policies[pid].get("Type") == pfilter]
     page, nxt = _paginate(out, payload)
     return _json(200, {"Policies": page, "NextToken": nxt})
 
@@ -815,9 +947,10 @@ def _attach_policy(payload):
     if rec is None:
         return error_response_json("TargetNotFoundException",
                                    f"Target {target_id} not found", 400)
-    if not _scp_type_enabled():
+    ptype = _policies[pid].get("Type")
+    if not _policy_type_enabled(ptype):
         return error_response_json("PolicyTypeNotEnabledException",
-                                   "The SERVICE_CONTROL_POLICY type is not enabled on this root", 400)
+                                   f"The {ptype} type is not enabled on this root", 400)
     if pid in (_target_policies.get(target_id) or []):
         return error_response_json("DuplicatePolicyAttachmentException",
                                    f"Policy {pid} is already attached to {target_id}", 400)
@@ -840,10 +973,16 @@ def _detach_policy(payload):
     if pid not in attached:
         return error_response_json("PolicyNotAttachedException",
                                    f"Policy {pid} is not attached to {target_id}", 400)
-    if len(attached) <= 1:
+    if pid == _RCPFULL_ID:
+        return error_response_json("ConstraintViolationException",
+                                   "The RCPFullAWSAccess policy cannot be detached", 400)
+    ptype = _policies[pid].get("Type")
+    same_type = [p for p in attached
+                 if p in _policies and _policies[p].get("Type") == ptype]
+    if len(same_type) <= 1:
         return error_response_json(
             "ConstraintViolationException",
-            "Cannot detach the last service control policy from a target", 400)
+            f"Cannot detach the last {ptype} from a target", 400)
     _detach(pid, target_id)
     return _json(200, {})
 
@@ -856,30 +995,34 @@ def _enable_policy_type(payload):
     if not root:
         return error_response_json("RootNotFoundException",
                                    f"Root {root_id} not found", 400)
-    if ptype != _SCP_TYPE:
+    if ptype not in _POLICY_TYPES:
         return error_response_json("PolicyTypeNotAvailableForOrganizationException",
                                    f"Policy type {ptype} is not available", 400)
     types = root.setdefault("PolicyTypes", [])
-    if any(pt.get("Type") == _SCP_TYPE and pt.get("Status") == "ENABLED" for pt in types):
+    if any(pt.get("Type") == ptype and pt.get("Status") == "ENABLED" for pt in types):
         return error_response_json("PolicyTypeAlreadyEnabledException",
-                                   "SERVICE_CONTROL_POLICY is already enabled", 400)
-    types[:] = [pt for pt in types if pt.get("Type") != _SCP_TYPE]
-    types.append({"Type": _SCP_TYPE, "Status": "ENABLED"})
+                                   f"{ptype} is already enabled", 400)
+    types[:] = [pt for pt in types if pt.get("Type") != ptype]
+    types.append({"Type": ptype, "Status": "ENABLED"})
     return _json(200, {"Root": dict(root)})
 
 
 def _disable_policy_type(payload):
     _ensure_org()
     root_id = payload.get("RootId")
+    ptype = payload.get("PolicyType")
     root = _roots.get(root_id) if root_id else None
     if not root:
         return error_response_json("RootNotFoundException",
                                    f"Root {root_id} not found", 400)
+    if ptype not in _POLICY_TYPES:
+        return error_response_json("PolicyTypeNotAvailableForOrganizationException",
+                                   f"Policy type {ptype} is not available", 400)
     types = root.get("PolicyTypes", [])
-    if not any(pt.get("Type") == _SCP_TYPE and pt.get("Status") == "ENABLED" for pt in types):
+    if not any(pt.get("Type") == ptype and pt.get("Status") == "ENABLED" for pt in types):
         return error_response_json("PolicyTypeNotEnabledException",
-                                   "SERVICE_CONTROL_POLICY is not enabled", 400)
-    root["PolicyTypes"] = [pt for pt in types if pt.get("Type") != _SCP_TYPE]
+                                   f"{ptype} is not enabled", 400)
+    root["PolicyTypes"] = [pt for pt in types if pt.get("Type") != ptype]
     return _json(200, {"Root": dict(root)})
 
 

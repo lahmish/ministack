@@ -117,6 +117,9 @@ _SERIAL_TESTS = {
     "tests/test_organizations_scp.py::test_scp_enf_region_condition",
     "tests/test_organizations_scp.py::test_scp_enf_resource_scoped_deny_kinesis",
     "tests/test_organizations_scp.py::test_scp_enf_principal_org_paths_condition",
+    "tests/test_organizations_rcp.py::test_rcp_enf_blocks_out_of_org_principal_on_kms",
+    "tests/test_organizations_rcp.py::test_rcp_enf_management_account_resource_exempt",
+    "tests/test_organizations_rcp.py::test_rcp_enf_applies_to_dynamodb",
 }
 
 

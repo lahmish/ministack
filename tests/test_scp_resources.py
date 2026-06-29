@@ -219,3 +219,20 @@ def test_garbage_body_is_safe():
     # Invalid bytes must not raise — extractor returns None (-> engine treats as '*').
     assert r.extract_resource_arn(
         "dynamodb", "POST", "/", _JSON, b"\xff\xfe not json", {}, "dynamodb:PutItem") is None
+
+
+# --- account_from_arn (used by RCP resource-account derivation) -------------
+
+def test_account_from_arn_present():
+    assert r.account_from_arn("arn:aws:kms:us-east-1:111122223333:key/abc") == "111122223333"
+    assert r.account_from_arn("arn:aws:sqs:us-east-1:444455556666:q") == "444455556666"
+
+
+def test_account_from_arn_absent_for_s3():
+    assert r.account_from_arn("arn:aws:s3:::bucket/key") is None
+
+
+def test_account_from_arn_invalid():
+    assert r.account_from_arn(None) is None
+    assert r.account_from_arn("not-an-arn") is None
+    assert r.account_from_arn("arn:aws:s3") is None
