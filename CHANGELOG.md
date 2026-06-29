@@ -7,8 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Organizations — account membership & OU placement** — the service modelled the OU tree and read paths but had no write path for member accounts, so `ListAccountsForParent` only ever returned the management account. Adds `CreateAccount` (async: returns `IN_PROGRESS`, then materialises the account and flips to `SUCCEEDED` on the first `DescribeCreateAccountStatus`), `DescribeCreateAccountStatus`, `MoveAccount`, `ListParents`, and `ListChildren`, plus the invite path (`InviteAccountToOrganization`, `AcceptHandshake`, `ListHandshakesForAccount`) so a caller-chosen 12-digit account id can be pinned onto a member account. `AcceptHandshake` may be called only by the invited account (derived from the signing access key).
+
 ### Fixed
 - **S3 — S3 → EventBridge events use AWS-conformant `detail-type`, `reason`, and `deletion-type`** — S3 → EventBridge delivery built the `detail-type` by string-mangling the granular notification event name (`Object ObjectCreated Put` instead of AWS's fixed `Object Created`), hardcoded `detail.reason` to `PutObject` for every event, and omitted `detail.deletion-type` on deletes. Because EventBridge rules match on `detail-type`, any rule written to the AWS-documented type (e.g. `["Object Created"]`) silently never matched. Each S3 event family now maps to its fixed EventBridge `detail-type`, with the per-API `reason` (`PutObject`/`POST Object`/`CopyObject`/`CompleteMultipartUpload`/`DeleteObject`) and a `deletion-type` on `Object Deleted`. Fixes #1005.
+
+---
 
 ## [1.3.69] — 2026-06-27
 
